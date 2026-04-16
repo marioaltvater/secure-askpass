@@ -15,6 +15,16 @@ import time
 import base64
 
 try:
+    import gi
+    gi.require_version('Gtk', '4.0')
+    gi.require_version('Adw', '1')
+    gi.require_version('Gdk', '4.0')
+    from gi.repository import Adw, GLib, Gtk, Gdk
+    HAS_GNOME_UI = True
+except Exception:
+    HAS_GNOME_UI = False
+
+try:
     import keyring
     HAS_KEYRING = True
 except ImportError:
@@ -55,6 +65,27 @@ def find_ssh_keypair():
     return None, None, None
 
 SSH_KEY, SSH_PUB, SSH_KEY_TYPE = find_ssh_keypair()
+
+def create_hidden_parent_window(title):
+    """Create an invisible transient parent window to help center dialogs."""
+    window = Gtk.Window(title=title)
+    width, height = 640, 400
+    display = Gdk.Display.get_default() if HAS_GNOME_UI else None
+    if display:
+        monitors = display.get_monitors()
+        if monitors and monitors.get_n_items() > 0:
+            monitor = monitors.get_item(0)
+            if monitor:
+                geometry = monitor.get_geometry()
+                width = max(geometry.width, 640)
+                height = max(geometry.height, 400)
+
+    window.set_default_size(width, height)
+    window.set_decorated(False)
+    window.set_resizable(False)
+    window.set_opacity(0.01)
+    window.present()
+    return window
 
 def generate_totp_secret():
     """Generate a random 20-byte TOTP secret"""
@@ -324,81 +355,93 @@ def encrypt_with_ssh_key(password):
     
     return None
 
-def get_password_via_gui():
-    """Get password using GUI dialog if available, otherwise fallback to terminal"""
-    password = None
-    confirm = None
-    
-    # Try kdialog first (KDE)
+def get_password_via_gnome():
+    """Get password using a native GNOME dialog."""
+    if not HAS_GNOME_UI:
+        print("Error: GNOME UI bindings are unavailable", file=sys.stderr)
+        return None, None
+
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        print("Error: GNOME askpass manager requires a graphical session", file=sys.stderr)
+        return None, None
+
+    desktop = " ".join(
+        os.environ.get(name, "")
+        for name in ("XDG_CURRENT_DESKTOP", "DESKTOP_SESSION")
+    ).lower()
+    if "gnome" not in desktop:
+        print("Error: GNOME askpass manager requires a GNOME session", file=sys.stderr)
+        return None, None
+
+    Adw.init()
+    parent = create_hidden_parent_window("Askpass Manager")
+
+    result = {"password": None, "confirm": None}
+    loop = GLib.MainLoop()
+
+    def finish(dialog, async_result, loop_ref):
+        try:
+            response = dialog.choose_finish(async_result)
+            if response == "store":
+                result["password"] = password_entry.get_text()
+                result["confirm"] = confirm_entry.get_text()
+        except Exception as e:
+            print(f"Error: GNOME password dialog failed: {e}", file=sys.stderr)
+        finally:
+            loop_ref.quit()
+
+    dialog = Adw.AlertDialog()
+    dialog.set_heading("Store sudo password")
+    dialog.set_body(
+        "Enter the sudo password you want to store, then confirm it below."
+    )
+    dialog.add_response("cancel", "Cancel")
+    dialog.add_response("store", "Store")
+    dialog.set_response_appearance("cancel", Adw.ResponseAppearance.DEFAULT)
+    dialog.set_response_appearance("store", Adw.ResponseAppearance.SUGGESTED)
+    dialog.set_close_response("cancel")
+    dialog.set_default_response("cancel")
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    box.set_margin_top(8)
+    box.set_margin_bottom(2)
+    box.set_margin_start(2)
+    box.set_margin_end(2)
+
+    password_entry = Gtk.PasswordEntry()
+    password_entry.set_show_peek_icon(True)
+    password_entry.set_placeholder_text("Password")
+    box.append(password_entry)
+
+    confirm_entry = Gtk.PasswordEntry()
+    confirm_entry.set_show_peek_icon(True)
+    confirm_entry.set_placeholder_text("Confirm password")
+    box.append(confirm_entry)
+
+    help_label = Gtk.Label()
+    help_label.set_wrap(True)
+    help_label.set_xalign(0)
+    help_label.set_text("This dialog follows GNOME dark mode automatically.")
+    box.append(help_label)
+
+    dialog.set_extra_child(box)
+    dialog.choose(parent, None, finish, loop)
+
     try:
-        result = subprocess.run(
-            ['kdialog', '--password', 'Enter sudo password to store:'],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            password = result.stdout.strip()
-            # Get confirmation
-            result = subprocess.run(
-                ['kdialog', '--password', 'Confirm password:'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0:
-                confirm = result.stdout.strip()
-                return password, confirm
-    except FileNotFoundError:
-        pass
-    
-    # Try zenity (GNOME/Ubuntu)
-    try:
-        result = subprocess.run(
-            ['zenity', '--password', '--title=Askpass Manager'],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            password = result.stdout.strip()
-            # Get confirmation
-            result = subprocess.run(
-                ['zenity', '--password', '--title=Askpass Manager - Confirm'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0:
-                confirm = result.stdout.strip()
-                return password, confirm
-    except FileNotFoundError:
-        pass
-    
-    # Try tkinter if available
-    try:
-        import tkinter as tk
-        from tkinter import simpledialog
-        
-        root = tk.Tk()
-        root.withdraw()  # Hide the main window
-        
-        password = simpledialog.askstring("Askpass Manager", "Enter sudo password to store:", show='*')
-        if password:
-            confirm = simpledialog.askstring("Askpass Manager", "Confirm password:", show='*')
-        
-        root.destroy()
-        return password, confirm
-    except ImportError:
-        pass
-    
-    # Fallback to terminal
-    password = getpass.getpass("Enter sudo password to store: ")
-    confirm = getpass.getpass("Confirm password: ")
-    return password, confirm
+        loop.run()
+    except KeyboardInterrupt:
+        return None, None
+    finally:
+        parent.close()
+
+    return result["password"], result["confirm"]
 
 def set_password():
-    """Store password encrypted with SSH key (primary) or other fallbacks"""
+    """Store password encrypted with SSH key."""
     print("Storing your sudo password...")
     
-    # Get password via GUI or terminal
-    password, confirm = get_password_via_gui()
+    # Get password via GNOME dialog
+    password, confirm = get_password_via_gnome()
     
     if not password or not confirm:
         print("Error: Password entry cancelled", file=sys.stderr)

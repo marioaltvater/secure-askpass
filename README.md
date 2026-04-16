@@ -1,6 +1,6 @@
 # SSH Askpass Helper
 
-A secure askpass implementation using SSH key encryption for non-interactive sudo operations.
+A GNOME-only askpass implementation using SSH key encryption for sudo approval.
 
 ## Installation
 
@@ -11,11 +11,12 @@ A secure askpass implementation using SSH key encryption for non-interactive sud
    - Ubuntu/Debian: `sudo apt install age`
    - macOS: `brew install age`
    - Or build from source: https://github.com/FiloSottile/age#installation
-4. Set the `SUDO_ASKPASS` environment variable in your shell configuration:
+4. Make sure you are in a GNOME session with GTK4/libadwaita available.
+5. Set the `SUDO_ASKPASS` environment variable in your shell configuration:
    ```bash
    export SUDO_ASKPASS="/path/to/secure-askpass/askpass"
    ```
-5. Store your sudo password:
+6. Store your sudo password:
    ```bash
    ./askpass-manager set
    ```
@@ -60,6 +61,8 @@ Or use the test command:
   - RSA/ECDSA/DSA: `~/.sudo_askpass.ssh`
 - Falls back to system keyring if available
 - Refuses plain text storage
+- The approval dialog is native GNOME GTK4/libadwaita and follows system dark mode
+- Askpass requires a GNOME graphical session and fails closed elsewhere
 
 ### Why age for Ed25519?
 
@@ -73,53 +76,21 @@ If your SSH key is password-protected (recommended!), the askpass tool will:
 3. Prompt for your SSH key passphrase via GUI dialog if needed
 4. Load the key into ssh-agent for the session
 
-**Workflow:** You only enter your SSH key passphrase once per session (via GUI), then sudo commands only require the confirmation dialog. No terminal interaction needed!
+**Workflow:** You only enter your SSH key passphrase once per session (via GUI), then sudo commands only require the confirmation dialog. No terminal interaction needed.
 
 ## Commands
 
 ```bash
 ./askpass-manager set        # Store password (GUI/terminal input)
-./askpass-manager set-totp   # Store password with TOTP verification (headless)
-./askpass-manager totp-setup # Set up TOTP for headless sessions
 ./askpass-manager get        # Check if password exists
 ./askpass-manager clear      # Remove password
 ./askpass-manager test       # Test sudo integration
 ./askpass-manager audit      # Show recent askpass usage
 ```
 
-## Headless/SSH Usage with TOTP
+## GNOME-only behavior
 
-For servers or SSH sessions without a display, use TOTP authentication:
-
-### Initial Setup (run once from a GUI session)
-
-```bash
-./askpass-manager totp-setup
-```
-
-This generates a TOTP secret and displays:
-- The secret key to add to your authenticator app
-- An `otpauth://` URL you can use with any TOTP app
-
-### Setting Password from Headless Session
-
-```bash
-./askpass-manager set-totp
-```
-
-Enter your 6-digit TOTP code, then your password.
-
-### Using sudo with TOTP
-
-When `DISPLAY` is not available, the askpass script will prompt for a TOTP code:
-
-```bash
-# Interactive - prompts for TOTP code
-sudo -A command
-
-# Non-interactive - pass TOTP via environment
-TOTP="123456" sudo -A command
-```
+This fork keeps the sudo approval path focused on GNOME. If you are not in a GNOME session, `sudo -A` will fail closed instead of falling back to a terminal or headless prompt.
 
 ## License
 

@@ -1,16 +1,16 @@
 # Security Enhancements for SSH Askpass Helper
 
 ## Overview
-The askpass script has been enhanced with multiple security layers including a Windows-style GUI confirmation dialog to prevent unauthorized access while maintaining usability for legitimate tools like Claude.
+The askpass script uses a native GNOME confirmation dialog and multiple security layers to prevent unauthorized access while keeping sudo prompts usable in a desktop session.
 
 ## Security Features
 
-### 1. GUI Confirmation Dialog (NEW)
-- Shows a Windows-style administrator confirmation dialog
+### 1. GNOME Confirmation Dialog
+- Shows a native GTK4/libadwaita dialog
 - Displays the command being executed, user, and hostname
 - Requires explicit user approval for each sudo request
-- Falls back through multiple GUI methods: Tkinter → GTK → zenity
-- Can be disabled for automation via configuration
+- Follows the active GNOME theme, including dark mode
+- Has no fallback to other GUI toolkits in this fork
 
 ### 2. Path-based Restrictions
 - Only allows execution from trusted directories: `/home/ian/` and `/tmp/`
@@ -26,8 +26,8 @@ The askpass script has been enhanced with multiple security layers including a W
 - Prevents unauthorized processes from retrieving passwords
 
 ### 5. Environment Verification
-- Requires proper terminal or SSH environment variables
-- Ensures askpass is called from legitimate user sessions
+- Requires a graphical GNOME session
+- Ensures askpass is called from a legitimate user desktop session
 
 ### 6. Audit Logging
 - All askpass usage is logged to syslog
@@ -41,20 +41,13 @@ Security settings can be configured via `askpass-config.json`:
     "require_user_confirmation": true,
     "allowed_paths": ["/home/ian/", "/tmp/"],
     "expiration_hours": 24,
-    "allowed_processes": ["sudo", "claude-code", "code", "bash", "sh"]
+    "allowed_processes": ["sudo", "claude-code", "codex", "opencode", "opencode-cli", "code", "bash", "sh"]
 }
 ```
 
 The configuration file is loaded from (in order of priority):
 1. `~/.config/secure-askpass/config.json`
 2. `./askpass-config.json` (in the same directory as the script)
-
-To disable GUI prompts for automation:
-```json
-{
-    "require_user_confirmation": false
-}
-```
 
 ## Monitoring
 Check audit logs with:

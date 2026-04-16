@@ -14,23 +14,18 @@ import hashlib
 import hmac
 import struct
 import base64
+from textwrap import shorten
 
-# GUI imports
-try:
-    import tkinter as tk
-    from tkinter import messagebox
-    HAS_GUI = True
-except ImportError:
-    HAS_GUI = False
-
-# Alternative GUI with GTK
+# GNOME UI imports
 try:
     import gi
-    gi.require_version('Gtk', '3.0')
-    from gi.repository import Gtk, GLib
-    HAS_GTK = True
-except ImportError:
-    HAS_GTK = False
+    gi.require_version('Gtk', '4.0')
+    gi.require_version('Adw', '1')
+    gi.require_version('Gdk', '4.0')
+    from gi.repository import Adw, Gio, GLib, Gtk, Gdk
+    HAS_GNOME_UI = True
+except Exception:
+    HAS_GNOME_UI = False
 
 # Try keyring as backup
 try:
@@ -169,12 +164,134 @@ def prompt_totp_confirmation():
         syslog.syslog(syslog.LOG_WARNING, "Invalid TOTP code provided")
         return False
 
+def is_gnome_session():
+    """Return True when the current desktop session is GNOME."""
+    desktop = " ".join(
+        os.environ.get(name, "")
+        for name in ("XDG_CURRENT_DESKTOP", "DESKTOP_SESSION")
+    ).lower()
+    return "gnome" in desktop
+
+def create_hidden_parent_window(title):
+    """Create an invisible transient parent window to help center dialogs."""
+    window = Gtk.Window(title=title)
+    width, height = 640, 400
+    display = Gdk.Display.get_default() if HAS_GNOME_UI else None
+    if display:
+        monitors = display.get_monitors()
+        if monitors and monitors.get_n_items() > 0:
+            monitor = monitors.get_item(0)
+            if monitor:
+                geometry = monitor.get_geometry()
+                width = max(geometry.width, 640)
+                height = max(geometry.height, 400)
+
+    window.set_default_size(width, height)
+    window.set_decorated(False)
+    window.set_resizable(False)
+    window.set_opacity(0.01)
+    window.present()
+    return window
+
+def build_confirmation_body(user, hostname, command):
+    """Build a GNOME-friendly confirmation body."""
+    safe_user = GLib.markup_escape_text(user)
+    safe_host = GLib.markup_escape_text(hostname)
+    safe_command = GLib.markup_escape_text(shorten(command, width=180, placeholder="..."))
+
+    return (
+        "<b>Administrator access is required.</b>\n"
+        f"User: <tt>{safe_user}</tt>\n"
+        f"Host: <tt>{safe_host}</tt>\n"
+        f"Command: <tt>{safe_command}</tt>"
+    )
+
+def prompt_gnome_confirmation():
+    """Show a native GNOME confirmation dialog."""
+    if not HAS_GNOME_UI:
+        syslog.syslog(syslog.LOG_ERR, "GNOME UI bindings are unavailable")
+        return False
+
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        syslog.syslog(syslog.LOG_WARNING, "No graphical display available for GNOME askpass")
+        return False
+
+    if not is_gnome_session():
+        syslog.syslog(syslog.LOG_WARNING, "GNOME-only askpass invoked outside a GNOME session")
+        return False
+
+    command = get_sudo_command()
+    hostname = socket.gethostname()
+    user = os.environ.get('USER', 'unknown')
+
+    Adw.init()
+    parent = create_hidden_parent_window("Secure Askpass")
+
+    approved = {"value": False}
+    loop = GLib.MainLoop()
+
+    def on_response(dialog, result, loop_ref):
+        try:
+            response = dialog.choose_finish(result)
+            approved["value"] = response == "allow"
+        except Exception as e:
+            syslog.syslog(syslog.LOG_ERR, f"GNOME askpass dialog failed: {e}")
+            approved["value"] = False
+        finally:
+            loop_ref.quit()
+
+    dialog = Adw.AlertDialog()
+    dialog.set_heading("Administrator privileges requested")
+    dialog.set_body_use_markup(True)
+    dialog.set_body(build_confirmation_body(user, hostname, command))
+    dialog.add_response("deny", "Deny")
+    dialog.add_response("allow", "Allow")
+    dialog.set_response_appearance("deny", Adw.ResponseAppearance.DESTRUCTIVE)
+    dialog.set_response_appearance("allow", Adw.ResponseAppearance.SUGGESTED)
+    dialog.set_close_response("deny")
+    dialog.set_default_response("deny")
+
+    details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    details.set_margin_top(8)
+    details.set_margin_bottom(2)
+    details.set_margin_start(2)
+    details.set_margin_end(2)
+
+    subtitle = Gtk.Label()
+    subtitle.set_wrap(True)
+    subtitle.set_xalign(0)
+    subtitle.set_use_markup(True)
+    subtitle.set_markup("Approve only if you recognize this command.")
+    details.append(subtitle)
+
+    command_label = Gtk.Label()
+    command_label.set_wrap(True)
+    command_label.set_selectable(True)
+    command_label.set_xalign(0)
+    command_label.add_css_class("monospace")
+    command_label.set_markup(
+        f"<tt>{GLib.markup_escape_text(shorten(command, width=240, placeholder='...'))}</tt>"
+    )
+    details.append(command_label)
+
+    dialog.set_extra_child(details)
+    dialog.choose(parent, None, on_response, loop)
+
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        return False
+    finally:
+        parent.close()
+
+    return approved["value"]
+
 # Default security configurations
 DEFAULT_CONFIG = {
     "require_user_confirmation": True,
     "allowed_paths": ["/home/ian/", "/tmp/"],
     "expiration_hours": 24,
-    "allowed_processes": ["sudo", "claude-code", "code", "bash", "sh"],
+    "allowed_processes": ["sudo", "claude-code", "codex", "opencode", "opencode-cli", "code", "bash", "sh"],
     "max_attempts_per_hour": 30,
     "lockout_minutes": 15
 }
@@ -294,86 +411,6 @@ def get_sudo_command():
     except:
         return "Unknown command"
 
-def show_confirmation_dialog():
-    """Show GUI confirmation dialog for sudo access"""
-    command = get_sudo_command()
-    hostname = socket.gethostname()
-    user = os.environ.get('USER', 'unknown')
-    
-    # Try Tkinter first
-    if HAS_GUI and 'DISPLAY' in os.environ:
-        try:
-            root = tk.Tk()
-            root.withdraw()  # Hide the main window
-            root.attributes('-topmost', True)  # Bring to front
-            
-            # Create dialog message
-            message = f"Administrator privileges requested\n\n"
-            message += f"User: {user}\n"
-            message += f"Host: {hostname}\n"
-            message += f"Command: {command}\n\n"
-            message += "Do you want to allow this?"
-            
-            result = messagebox.askyesno(
-                "Sudo Authentication Required",
-                message,
-                icon=messagebox.WARNING
-            )
-            root.destroy()
-            return result
-        except Exception as e:
-            syslog.syslog(syslog.LOG_WARNING, f"Tkinter dialog failed: {e}")
-    
-    # Try GTK as fallback
-    if HAS_GTK and 'DISPLAY' in os.environ:
-        try:
-            dialog = Gtk.MessageDialog(
-                parent=None,
-                modal=True,
-                message_type=Gtk.MessageType.WARNING,
-                buttons=Gtk.ButtonsType.YES_NO,
-                text="Administrator privileges requested"
-            )
-            dialog.format_secondary_text(
-                f"User: {user}\n"
-                f"Host: {hostname}\n"
-                f"Command: {command}\n\n"
-                f"Do you want to allow this?"
-            )
-            dialog.set_keep_above(True)
-            dialog.set_urgency_hint(True)
-            
-            response = dialog.run()
-            dialog.destroy()
-            return response == Gtk.ResponseType.YES
-        except Exception as e:
-            syslog.syslog(syslog.LOG_WARNING, f"GTK dialog failed: {e}")
-    
-    # Fallback to zenity if available
-    if 'DISPLAY' in os.environ:
-        try:
-            message = f"Administrator privileges requested\\n\\n"
-            message += f"User: {user}\\n"
-            message += f"Host: {hostname}\\n"
-            message += f"Command: {command}\\n\\n"
-            message += "Do you want to allow this?"
-            
-            result = subprocess.run(
-                ['zenity', '--question', '--title=Sudo Authentication Required',
-                 f'--text={message}', '--width=400'],
-                capture_output=True
-            )
-            return result.returncode == 0
-        except:
-            pass
-    
-    # If GUI is not available, try TOTP confirmation
-    if 'DISPLAY' not in os.environ:
-        syslog.syslog(syslog.LOG_INFO, "No display available, trying TOTP confirmation")
-        return prompt_totp_confirmation()
-
-    return False
-
 def check_security():
     """Perform security checks before retrieving password"""
     # 0. Rate limit check
@@ -401,6 +438,11 @@ def check_security():
     if not (os.getenv('SSH_AUTH_SOCK') or os.getenv('SSH_TTY') or os.getenv('TERM')):
         syslog.syslog(syslog.LOG_WARNING, "Askpass called without proper environment")
         return False
+
+    # 3b. GNOME session requirement
+    if not is_gnome_session():
+        syslog.syslog(syslog.LOG_WARNING, "Askpass called outside a GNOME session")
+        return False
     
     # 4. Time-based expiration check
     if os.path.exists(SSH_ENCRYPTED_FILE):
@@ -413,9 +455,9 @@ def check_security():
                 pass
             return False
     
-    # 5. User confirmation dialog (if enabled and GUI available)
+    # 5. User confirmation dialog (GNOME only)
     if REQUIRE_USER_CONFIRMATION:
-        if not show_confirmation_dialog():
+        if not prompt_gnome_confirmation():
             syslog.syslog(syslog.LOG_WARNING, "User denied sudo access via dialog")
             return False
         syslog.syslog(syslog.LOG_INFO, "User approved sudo access via dialog")
@@ -475,53 +517,69 @@ def ensure_ssh_key_loaded():
         return False
 
 def prompt_ssh_passphrase():
-    """Prompt for SSH key passphrase using GUI"""
-    # Try Tkinter first
-    if HAS_GUI and 'DISPLAY' in os.environ:
+    """Prompt for SSH key passphrase using a GNOME dialog."""
+    if not HAS_GNOME_UI:
+        syslog.syslog(syslog.LOG_ERR, "GNOME UI bindings are unavailable")
+        return None
+
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        syslog.syslog(syslog.LOG_WARNING, "No graphical display available for SSH key prompt")
+        return None
+
+    if not is_gnome_session():
+        syslog.syslog(syslog.LOG_WARNING, "SSH key prompt requested outside a GNOME session")
+        return None
+
+    Adw.init()
+    parent = create_hidden_parent_window("Secure Askpass")
+
+    result = {"value": None}
+    loop = GLib.MainLoop()
+
+    def on_response(dialog, async_result, loop_ref):
         try:
-            import tkinter.simpledialog as simpledialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes('-topmost', True)
+            response = dialog.choose_finish(async_result)
+            if response == "unlock":
+                result["value"] = entry.get_text()
+        except Exception as e:
+            syslog.syslog(syslog.LOG_ERR, f"GNOME SSH prompt failed: {e}")
+        finally:
+            loop_ref.quit()
 
-            passphrase = simpledialog.askstring(
-                "SSH Key Passphrase Required",
-                f"Enter passphrase for {SSH_KEY}:",
-                show='*'
-            )
-            root.destroy()
-            return passphrase
-        except Exception:
-            pass
+    dialog = Adw.AlertDialog()
+    dialog.set_heading("SSH key passphrase required")
+    dialog.set_body(
+        f"Unlock {SSH_KEY} so sudo can reuse your SSH key for encrypted storage."
+    )
+    dialog.add_response("cancel", "Cancel")
+    dialog.add_response("unlock", "Unlock")
+    dialog.set_response_appearance("cancel", Adw.ResponseAppearance.DEFAULT)
+    dialog.set_response_appearance("unlock", Adw.ResponseAppearance.SUGGESTED)
+    dialog.set_close_response("cancel")
+    dialog.set_default_response("cancel")
 
-    # Try zenity
-    if 'DISPLAY' in os.environ:
-        try:
-            result = subprocess.run(
-                ['zenity', '--password', '--title=SSH Key Passphrase Required',
-                 f'--text=Enter passphrase for {SSH_KEY}:'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except FileNotFoundError:
-            pass
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    box.set_margin_top(8)
+    box.set_margin_bottom(2)
+    box.set_margin_start(2)
+    box.set_margin_end(2)
 
-    # Try kdialog
-    if 'DISPLAY' in os.environ:
-        try:
-            result = subprocess.run(
-                ['kdialog', '--password', f'Enter passphrase for {SSH_KEY}:'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except FileNotFoundError:
-            pass
+    entry = Gtk.PasswordEntry()
+    entry.set_show_peek_icon(True)
+    entry.set_placeholder_text("SSH key passphrase")
+    box.append(entry)
 
-    return None
+    dialog.set_extra_child(box)
+    dialog.choose(parent, None, on_response, loop)
+
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        return None
+    finally:
+        parent.close()
+
+    return result["value"]
 
 def decrypt_with_age(encrypted_file):
     """Decrypt data using age with SSH private key"""
