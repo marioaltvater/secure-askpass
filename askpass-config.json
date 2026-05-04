@@ -2,5 +2,7 @@
     "require_user_confirmation": true,
     "allowed_paths": ["/"],
     "expiration_hours": 24,
-    "allowed_processes": ["sudo", "claude-code", "code", "bash", "sh"]
+    "sudo_parent_processes": ["sudo", "sudo.ws"],
+    "max_attempts_per_hour": 30,
+    "lockout_minutes": 15
 }

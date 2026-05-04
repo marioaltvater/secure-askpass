@@ -24,25 +24,16 @@ try:
 except Exception:
     HAS_GNOME_UI = False
 
-try:
-    import keyring
-    HAS_KEYRING = True
-except ImportError:
-    HAS_KEYRING = False
-
 TOTP_SECRET_FILE = os.path.expanduser("~/.config/secure-askpass/totp_secret.enc")
 
-SERVICE_NAME = "sudo-askpass"
-USERNAME = "sudo"
 SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
 AGE_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.age")
 
-# SSH key types to try in order of preference
+# age supports SSH Ed25519 and RSA recipients. ECDSA/DSA are signing keys and
+# are intentionally not used for password encryption.
 SSH_KEY_TYPES = [
     ("~/.ssh/id_ed25519", "~/.ssh/id_ed25519.pub", "Ed25519"),
-    ("~/.ssh/id_ecdsa", "~/.ssh/id_ecdsa.pub", "ECDSA"),
-    ("~/.ssh/id_rsa", "~/.ssh/id_rsa.pub", "RSA"),
-    ("~/.ssh/id_dsa", "~/.ssh/id_dsa.pub", "DSA")
+    ("~/.ssh/id_rsa", "~/.ssh/id_rsa.pub", "RSA")
 ]
 
 def check_age_available():
@@ -56,7 +47,7 @@ def check_age_available():
 HAS_AGE = check_age_available()
 
 def find_ssh_keypair():
-    """Find the first available SSH keypair"""
+    """Find the first supported SSH keypair."""
     for priv_path, pub_path, key_type in SSH_KEY_TYPES:
         priv_full = os.path.expanduser(priv_path)
         pub_full = os.path.expanduser(pub_path)
@@ -87,19 +78,18 @@ def create_hidden_parent_window(title):
     window.present()
     return window
 
+def find_unsupported_ssh_keys():
+    unsupported = []
+    for key_name in ("id_ecdsa", "id_dsa"):
+        priv = os.path.expanduser(f"~/.ssh/{key_name}")
+        pub = os.path.expanduser(f"~/.ssh/{key_name}.pub")
+        if os.path.exists(priv) or os.path.exists(pub):
+            unsupported.append(key_name)
+    return unsupported
+
 def generate_totp_secret():
     """Generate a random 20-byte TOTP secret"""
     return base64.b32encode(os.urandom(20)).decode('ascii')
-
-def get_totp_code(secret, time_step=30):
-    """Generate current TOTP code from secret"""
-    key = base64.b32decode(secret.upper().replace(' ', ''))
-    counter = int(time.time() // time_step)
-    counter_bytes = struct.pack('>Q', counter)
-    hmac_hash = hmac.new(key, counter_bytes, hashlib.sha1).digest()
-    offset = hmac_hash[-1] & 0x0f
-    code = struct.unpack('>I', hmac_hash[offset:offset+4])[0] & 0x7fffffff
-    return str(code % 1000000).zfill(6)
 
 def verify_totp(secret, provided_code, window=1):
     """Verify TOTP code with optional time window tolerance"""
@@ -240,42 +230,32 @@ def store_password_internal(password):
             for i in range(len(temp)):
                 temp[i] = 0
 
-    if SSH_KEY and SSH_PUB:
-        if SSH_KEY_TYPE == "Ed25519" and HAS_AGE:
-            encrypted = encrypt_with_age(password)
-            if encrypted:
-                try:
-                    with open(AGE_ENCRYPTED_FILE, 'wb') as f:
-                        f.write(encrypted)
-                    os.chmod(AGE_ENCRYPTED_FILE, 0o600)
-                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {AGE_ENCRYPTED_FILE}")
-                    secure_clear(password)
-                    return True
-                except Exception as e:
-                    print(f"Error saving age encrypted file: {e}")
-        elif SSH_KEY_TYPE == "Ed25519" and not HAS_AGE:
-            print("Error: Ed25519 keys require the 'age' encryption tool", file=sys.stderr)
-            return False
-        else:
-            encrypted = encrypt_with_ssh_key(password)
-            if encrypted:
-                try:
-                    with open(SSH_ENCRYPTED_FILE, 'wb') as f:
-                        f.write(encrypted)
-                    os.chmod(SSH_ENCRYPTED_FILE, 0o600)
-                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {SSH_ENCRYPTED_FILE}")
-                    secure_clear(password)
-                    return True
-                except Exception as e:
-                    print(f"Error saving SSH encrypted file: {e}")
+    if not HAS_AGE:
+        print("Error: secure-askpass requires the 'age' encryption tool", file=sys.stderr)
+        print("Install age, then run askpass-manager set again.", file=sys.stderr)
+        return False
 
-    if HAS_KEYRING:
+    if not SSH_KEY or not SSH_PUB:
+        unsupported = find_unsupported_ssh_keys()
+        if unsupported:
+            print(f"Error: found unsupported SSH key(s): {', '.join(unsupported)}", file=sys.stderr)
+            print("Use an Ed25519 or RSA SSH key for secure-askpass storage.", file=sys.stderr)
+        else:
+            print("Error: no supported SSH keypair found", file=sys.stderr)
+            print("Generate one with: ssh-keygen -t ed25519", file=sys.stderr)
+        return False
+
+    encrypted = encrypt_with_age(password)
+    if encrypted:
         try:
-            keyring.set_password(SERVICE_NAME, USERNAME, password)
-            print("Password stored successfully in keyring")
+            with open(AGE_ENCRYPTED_FILE, 'wb') as f:
+                f.write(encrypted)
+            os.chmod(AGE_ENCRYPTED_FILE, 0o600)
+            print(f"Password encrypted with age using your {SSH_KEY_TYPE} SSH key and stored in {AGE_ENCRYPTED_FILE}")
+            secure_clear(password)
             return True
         except Exception as e:
-            print(f"Keyring storage failed: {e}")
+            print(f"Error saving age encrypted file: {e}", file=sys.stderr)
 
     print("Error: Unable to store password securely", file=sys.stderr)
     return False
@@ -286,7 +266,6 @@ def encrypt_with_age(password):
         return None
 
     try:
-        # Use age with SSH public key
         result = subprocess.run(
             ['age', '-R', SSH_PUB, '-a'],
             input=password.encode(),
@@ -295,64 +274,12 @@ def encrypt_with_age(password):
 
         if result.returncode == 0:
             return result.stdout
+        if result.stderr:
+            print(result.stderr.decode('utf-8', errors='replace').strip(), file=sys.stderr)
 
     except Exception:
         pass
 
-    return None
-
-def extract_pubkey_for_openssl():
-    """Convert SSH public key to OpenSSL format"""
-    if not SSH_PUB:
-        return None
-
-    try:
-        # First extract the public key in PEM format
-        result = subprocess.run(
-            ['ssh-keygen', '-e', '-m', 'PKCS8', '-f', SSH_PUB],
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode == 0:
-            # Use secure temp file instead of predictable path
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as temp_file:
-                temp_pem = temp_file.name
-                temp_file.write(result.stdout)
-            # Set restrictive permissions
-            os.chmod(temp_pem, 0o600)
-            return temp_pem
-
-    except Exception:
-        pass
-
-    return None
-
-def encrypt_with_ssh_key(password):
-    """Encrypt password with SSH public key"""
-    try:
-        # Extract public key in OpenSSL format
-        pem_pubkey = extract_pubkey_for_openssl()
-        if not pem_pubkey:
-            return None
-        
-        # Encrypt with public key
-        result = subprocess.run(
-            ['openssl', 'pkeyutl', '-encrypt', '-pubin', '-inkey', pem_pubkey],
-            input=password.encode(),
-            capture_output=True
-        )
-        
-        # Clean up temp file
-        os.remove(pem_pubkey)
-        
-        if result.returncode == 0:
-            return result.stdout
-        
-    except Exception:
-        pass
-    
     return None
 
 def get_password_via_gnome():
@@ -437,7 +364,7 @@ def get_password_via_gnome():
     return result["password"], result["confirm"]
 
 def set_password():
-    """Store password encrypted with SSH key."""
+    """Store password encrypted with age and a supported SSH key."""
     print("Storing your sudo password...")
     
     # Get password via GNOME dialog
@@ -451,99 +378,18 @@ def set_password():
         print("Error: Passwords don't match", file=sys.stderr)
         return False
     
-    # Clear passwords from memory after use
-    def secure_clear(data):
-        if data:
-            # Overwrite with zeros
-            temp = bytearray(data, 'utf-8')
-            for i in range(len(temp)):
-                temp[i] = 0
-    
-    # Priority 1: Try SSH encryption
-    if SSH_KEY and SSH_PUB:
-        print(f"Using SSH key encryption ({SSH_KEY_TYPE} key)...")
-
-        # For Ed25519 keys, use age if available
-        if SSH_KEY_TYPE == "Ed25519" and HAS_AGE:
-            print("Using age encryption for Ed25519 key...")
-            encrypted = encrypt_with_age(password)
-
-            if encrypted:
-                try:
-                    with open(AGE_ENCRYPTED_FILE, 'wb') as f:
-                        f.write(encrypted)
-                    os.chmod(AGE_ENCRYPTED_FILE, 0o600)
-                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {AGE_ENCRYPTED_FILE}")
-                    # Clear sensitive data from memory
-                    secure_clear(password)
-                    secure_clear(confirm)
-                    return True
-                except Exception as e:
-                    print(f"Error saving age encrypted file: {e}")
-
-        # For Ed25519 without age, show helpful error
-        elif SSH_KEY_TYPE == "Ed25519" and not HAS_AGE:
-            print("Error: Ed25519 keys require the 'age' encryption tool", file=sys.stderr)
-            print("Install age: https://github.com/FiloSottile/age#installation", file=sys.stderr)
-            print("Or generate an RSA key: ssh-keygen -t rsa -b 4096", file=sys.stderr)
-            return False
-
-        # For RSA/ECDSA/DSA, use OpenSSL
-        else:
-            encrypted = encrypt_with_ssh_key(password)
-
-            if encrypted:
-                try:
-                    with open(SSH_ENCRYPTED_FILE, 'wb') as f:
-                        f.write(encrypted)
-                    os.chmod(SSH_ENCRYPTED_FILE, 0o600)
-                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {SSH_ENCRYPTED_FILE}")
-                    # Clear sensitive data from memory
-                    secure_clear(password)
-                    secure_clear(confirm)
-                    return True
-                except Exception as e:
-                    print(f"Error saving SSH encrypted file: {e}")
-    else:
-        print("SSH keys not found, trying other methods...")
-    
-    # Priority 2: Try keyring
-    if HAS_KEYRING:
-        try:
-            keyring.set_password(SERVICE_NAME, USERNAME, password)
-            print("Password stored successfully in keyring")
-            return True
-        except Exception as e:
-            print(f"Keyring storage failed: {e}")
-    
-    # No more insecure fallbacks
-    print("Error: Unable to store password securely", file=sys.stderr)
-    print("Please ensure you have either:")
-    print("  - SSH keys (ed25519, ecdsa, rsa, or dsa) for encryption")
-    print("  - A working keyring system")
-    return False
+    return store_password_internal(password)
 
 def get_password():
-    """Check for stored password in priority order"""
-    # Check age encrypted file
+    """Check for stored password."""
     if os.path.exists(AGE_ENCRYPTED_FILE):
         print("Password found (age encrypted with SSH key)")
         return True
 
-    # Check SSH encrypted file
     if os.path.exists(SSH_ENCRYPTED_FILE):
-        print("Password found (SSH encrypted)")
-        return True
-
-    # Check keyring
-    if HAS_KEYRING:
-        try:
-            password = keyring.get_password(SERVICE_NAME, USERNAME)
-            if password:
-                print("Password found in keyring")
-                return True
-        except Exception:
-            pass
+        print("Legacy OpenSSL password file found, but current secure-askpass uses age")
+        print("Run 'askpass-manager set' to rewrite it as ~/.sudo_askpass.age")
+        return False
 
     print("No password found")
     return False
@@ -570,17 +416,9 @@ def clear_password():
         except Exception as e:
             print(f"Error clearing SSH encrypted file: {e}")
     
-    # Clear from keyring
-    if HAS_KEYRING:
-        try:
-            keyring.delete_password(SERVICE_NAME, USERNAME)
-            print("Password cleared from keyring")
-            cleared = True
-        except Exception:
-            pass
-    
     # Clear legacy files if they exist (cleanup)
     legacy_files = [
+        SSH_ENCRYPTED_FILE,
         os.path.expanduser("~/.sudo_askpass.enc"),
         os.path.expanduser("~/.sudo_askpass"),
         os.path.expanduser("~/.sudo_askpass.gpg")
@@ -611,12 +449,11 @@ def test_sudo():
     # Make sure askpass is executable
     os.chmod(askpass_path, 0o755)
     
-    # Test with a simple command
     env = os.environ.copy()
     env['SUDO_ASKPASS'] = askpass_path
     
-    print("Testing sudo with askpass...")
-    result = subprocess.run(['sudo', '-A', 'echo', 'Success!'], 
+    print("Testing sudo with askpass (forcing a fresh sudo authentication)...")
+    result = subprocess.run(['sudo', '-k', '-A', 'echo', 'Success!'],
                            env=env, capture_output=True, text=True)
     
     if result.returncode == 0:
@@ -625,6 +462,44 @@ def test_sudo():
     else:
         print("Test failed:", result.stderr.strip(), file=sys.stderr)
         return False
+
+def doctor():
+    """Check local prerequisites without invoking sudo."""
+    ok = True
+    print("secure-askpass doctor")
+    print("-" * 24)
+
+    if HAS_AGE:
+        print("age: found")
+    else:
+        print("age: missing", file=sys.stderr)
+        ok = False
+
+    if SSH_KEY and SSH_PUB:
+        print(f"ssh key: {SSH_KEY_TYPE} ({SSH_KEY})")
+    else:
+        print("ssh key: no supported Ed25519 or RSA keypair found", file=sys.stderr)
+        unsupported = find_unsupported_ssh_keys()
+        if unsupported:
+            print(f"unsupported key(s): {', '.join(unsupported)}", file=sys.stderr)
+        ok = False
+
+    askpass_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'askpass')
+    if os.path.exists(askpass_path) and os.access(askpass_path, os.X_OK):
+        print(f"askpass: executable ({askpass_path})")
+    else:
+        print(f"askpass: not executable ({askpass_path})", file=sys.stderr)
+        ok = False
+
+    if os.path.exists(AGE_ENCRYPTED_FILE):
+        mode = oct(os.stat(AGE_ENCRYPTED_FILE).st_mode & 0o777)
+        print(f"stored password: {AGE_ENCRYPTED_FILE} ({mode})")
+        if mode != "0o600":
+            ok = False
+    else:
+        print("stored password: missing")
+
+    return ok
 
 def show_audit_log():
     """Display recent audit log entries"""
@@ -636,7 +511,7 @@ def show_audit_log():
     
     try:
         import json
-        from datetime import datetime, timedelta
+        from datetime import datetime
         
         # Read last 50 entries
         with open(audit_file, 'r') as f:
@@ -664,7 +539,7 @@ def show_audit_log():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: askpass-manager [set|set-totp|totp-setup|get|clear|test|audit]")
+        print("Usage: askpass-manager [set|set-totp|totp-setup|get|clear|test|doctor|audit]")
         print()
         print("Commands:")
         print("  set        - Store password (GUI/terminal input)")
@@ -672,12 +547,12 @@ def main():
         print("  totp-setup - Set up TOTP for headless password entry")
         print("  get        - Check if password exists")
         print("  clear      - Remove stored password")
-        print("  test       - Test sudo with askpass")
+        print("  test       - Test sudo with askpass and force fresh auth")
+        print("  doctor     - Check local prerequisites without sudo")
         print("  audit      - Show recent askpass usage")
         print()
-        print("Storage methods (secure only):")
-        print("  1. SSH key encryption (supports ed25519, ecdsa, rsa, dsa)")
-        print("  2. System keyring")
+        print("Storage:")
+        print("  age-encrypted file using an Ed25519 or RSA SSH key")
         print()
         print("For headless/SSH sessions:")
         print("  1. Run 'totp-setup' once from a GUI session")
@@ -699,6 +574,8 @@ def main():
         success = clear_password()
     elif command == "test":
         success = test_sudo()
+    elif command == "doctor":
+        success = doctor()
     elif command == "audit":
         success = show_audit_log()
     else:

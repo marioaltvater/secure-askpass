@@ -9,7 +9,6 @@ import subprocess
 import time
 import syslog
 import socket
-import tempfile
 import hashlib
 import hmac
 import struct
@@ -27,15 +26,6 @@ try:
 except Exception:
     HAS_GNOME_UI = False
 
-# Try keyring as backup
-try:
-    import keyring
-    HAS_KEYRING = True
-except ImportError:
-    HAS_KEYRING = False
-
-SERVICE_NAME = "sudo-askpass"
-USERNAME = "sudo"
 SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
 AGE_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.age")
 CONFIG_FILE = os.path.expanduser("~/.config/secure-askpass/config.json")
@@ -43,12 +33,11 @@ RATE_LIMIT_FILE = os.path.expanduser("~/.config/secure-askpass/rate_limit.json")
 AUDIT_LOG_FILE = os.path.expanduser("~/.config/secure-askpass/audit.log")
 TOTP_SECRET_FILE = os.path.expanduser("~/.config/secure-askpass/totp_secret.enc")
 
-# SSH key types to try in order of preference
+# age supports SSH Ed25519 and RSA recipients. Other SSH key types are signing
+# keys, so they are intentionally not advertised as storage backends here.
 SSH_KEY_TYPES = [
     ("~/.ssh/id_ed25519", "Ed25519"),
-    ("~/.ssh/id_ecdsa", "ECDSA"),
-    ("~/.ssh/id_rsa", "RSA"),
-    ("~/.ssh/id_dsa", "DSA")
+    ("~/.ssh/id_rsa", "RSA")
 ]
 
 def check_age_available():
@@ -61,33 +50,34 @@ def check_age_available():
 
 HAS_AGE = check_age_available()
 
-def find_ssh_key():
-    """Find the first available SSH private key"""
+def find_ssh_keys():
+    """Find supported SSH private keys for age decryption."""
+    keys = []
     for key_path, key_type in SSH_KEY_TYPES:
         full_path = os.path.expanduser(key_path)
         if os.path.exists(full_path):
-            return full_path, key_type
-    return None, None
+            keys.append((full_path, key_type))
+    return keys
 
-SSH_KEY, SSH_KEY_TYPE = find_ssh_key()
+SSH_KEYS = find_ssh_keys()
+SSH_KEY, SSH_KEY_TYPE = SSH_KEYS[0] if SSH_KEYS else (None, None)
 
 def load_totp_secret():
     """Load and decrypt TOTP secret"""
     if not os.path.exists(TOTP_SECRET_FILE):
         return None
 
-    if not HAS_AGE or not SSH_KEY:
+    if not HAS_AGE or not SSH_KEYS:
         return None
 
     try:
         with open(TOTP_SECRET_FILE, 'rb') as f:
             encrypted = f.read()
 
-        result = subprocess.run(
-            ['age', '-d', '-i', SSH_KEY],
-            input=encrypted,
-            capture_output=True
-        )
+        command = ['age', '-d']
+        for key_path, _ in SSH_KEYS:
+            command.extend(['-i', key_path])
+        result = subprocess.run(command, input=encrypted, capture_output=True)
 
         if result.returncode == 0:
             return result.stdout.decode('utf-8').strip()
@@ -289,9 +279,9 @@ def prompt_gnome_confirmation():
 # Default security configurations
 DEFAULT_CONFIG = {
     "require_user_confirmation": True,
-    "allowed_paths": ["/home/ian/", "/tmp/"],
+    "allowed_paths": ["/"],
     "expiration_hours": 24,
-    "allowed_processes": ["sudo", "claude-code", "codex", "opencode", "opencode-cli", "code", "bash", "sh"],
+    "sudo_parent_processes": ["sudo", "sudo.ws"],
     "max_attempts_per_hour": 30,
     "lockout_minutes": 15
 }
@@ -299,23 +289,22 @@ DEFAULT_CONFIG = {
 # Load configuration
 def load_config():
     config = DEFAULT_CONFIG.copy()
-    
-    # Try to load from user config directory first
-    if os.path.exists(CONFIG_FILE):
-        try:
-            import json
-            with open(CONFIG_FILE, 'r') as f:
-                user_config = json.load(f)
-                config.update(user_config)
-        except:
-            pass
-    
-    # Try to load from script directory
+
     local_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'askpass-config.json')
     if os.path.exists(local_config):
         try:
             import json
             with open(local_config, 'r') as f:
+                user_config = json.load(f)
+                config.update(user_config)
+        except:
+            pass
+
+    # Per-user config is loaded last so VM-local choices always win.
+    if os.path.exists(CONFIG_FILE):
+        try:
+            import json
+            with open(CONFIG_FILE, 'r') as f:
                 user_config = json.load(f)
                 config.update(user_config)
         except:
@@ -326,7 +315,7 @@ def load_config():
 config = load_config()
 ALLOWED_PATHS = config['allowed_paths']
 EXPIRATION_HOURS = config['expiration_hours']
-ALLOWED_PARENT_PROCESSES = config['allowed_processes']
+SUDO_PARENT_PROCESSES = config.get('sudo_parent_processes', config.get('allowed_processes', ["sudo", "sudo.ws"]))
 REQUIRE_USER_CONFIRMATION = config['require_user_confirmation']
 MAX_ATTEMPTS_PER_HOUR = config['max_attempts_per_hour']
 LOCKOUT_MINUTES = config['lockout_minutes']
@@ -423,12 +412,13 @@ def check_security():
         syslog.syslog(syslog.LOG_WARNING, f"Askpass called from unauthorized path: {cwd}")
         return False
     
-    # 2. Process validation
+    # 2. Validate that sudo itself invoked askpass. The originating agent or
+    # shell is not a reliable parent here; sudo is.
     try:
         ppid = os.getppid()
         proc_name = open(f'/proc/{ppid}/comm').read().strip()
-        if proc_name not in ALLOWED_PARENT_PROCESSES:
-            syslog.syslog(syslog.LOG_WARNING, f"Askpass called by unauthorized process: {proc_name}")
+        if proc_name not in SUDO_PARENT_PROCESSES:
+            syslog.syslog(syslog.LOG_WARNING, f"Askpass called by unexpected parent process: {proc_name}")
             return False
     except Exception:
         syslog.syslog(syslog.LOG_WARNING, "Could not determine parent process")
@@ -445,12 +435,14 @@ def check_security():
         return False
     
     # 4. Time-based expiration check
-    if os.path.exists(SSH_ENCRYPTED_FILE):
-        age = time.time() - os.path.getmtime(SSH_ENCRYPTED_FILE)
-        if age > EXPIRATION_HOURS * 3600:
-            syslog.syslog(syslog.LOG_INFO, f"Password expired after {EXPIRATION_HOURS} hours")
+    for encrypted_file in (AGE_ENCRYPTED_FILE, SSH_ENCRYPTED_FILE):
+        if not os.path.exists(encrypted_file):
+            continue
+        file_age = time.time() - os.path.getmtime(encrypted_file)
+        if file_age > EXPIRATION_HOURS * 3600:
+            syslog.syslog(syslog.LOG_INFO, f"Password file expired after {EXPIRATION_HOURS} hours: {encrypted_file}")
             try:
-                os.remove(SSH_ENCRYPTED_FILE)
+                os.remove(encrypted_file)
             except:
                 pass
             return False
@@ -464,9 +456,9 @@ def check_security():
     
     return True
 
-def ensure_ssh_key_loaded():
+def ensure_ssh_key_loaded(key_path):
     """Ensure SSH key is loaded in ssh-agent, prompt for passphrase if needed"""
-    if not SSH_KEY or not os.path.exists(SSH_KEY):
+    if not key_path or not os.path.exists(key_path):
         return False
 
     try:
@@ -486,7 +478,7 @@ def ensure_ssh_key_loaded():
         if check_result.returncode == 0:
             # Check if our specific key is loaded
             key_fingerprint = subprocess.run(
-                ['ssh-keygen', '-lf', SSH_KEY],
+                ['ssh-keygen', '-lf', key_path],
                 capture_output=True,
                 text=True
             )
@@ -496,13 +488,13 @@ def ensure_ssh_key_loaded():
                     return True
 
         # Key not loaded, prompt for passphrase
-        passphrase = prompt_ssh_passphrase()
+        passphrase = prompt_ssh_passphrase(key_path)
         if not passphrase:
             return False
 
         # Add key to ssh-agent with passphrase
         add_result = subprocess.run(
-            ['ssh-add', SSH_KEY],
+            ['ssh-add', key_path],
             input=passphrase.encode(),
             capture_output=True
         )
@@ -516,7 +508,7 @@ def ensure_ssh_key_loaded():
         syslog.syslog(syslog.LOG_ERR, f"Failed to ensure SSH key loaded: {e}")
         return False
 
-def prompt_ssh_passphrase():
+def prompt_ssh_passphrase(key_path):
     """Prompt for SSH key passphrase using a GNOME dialog."""
     if not HAS_GNOME_UI:
         syslog.syslog(syslog.LOG_ERR, "GNOME UI bindings are unavailable")
@@ -549,7 +541,7 @@ def prompt_ssh_passphrase():
     dialog = Adw.AlertDialog()
     dialog.set_heading("SSH key passphrase required")
     dialog.set_body(
-        f"Unlock {SSH_KEY} so sudo can reuse your SSH key for encrypted storage."
+        f"Unlock {key_path} so sudo can reuse your SSH key for encrypted storage."
     )
     dialog.add_response("cancel", "Cancel")
     dialog.add_response("unlock", "Unlock")
@@ -583,96 +575,39 @@ def prompt_ssh_passphrase():
 
 def decrypt_with_age(encrypted_file):
     """Decrypt data using age with SSH private key"""
-    if not HAS_AGE or not SSH_KEY or not os.path.exists(SSH_KEY):
-        return None
-
-    # Ensure SSH key is loaded in ssh-agent
-    if not ensure_ssh_key_loaded():
-        syslog.syslog(syslog.LOG_ERR, "Failed to load SSH key into ssh-agent")
+    if not HAS_AGE or not SSH_KEYS:
         return None
 
     try:
         with open(encrypted_file, 'rb') as f:
             encrypted_data = f.read()
 
-        # Use age with SSH private key identity
-        result = subprocess.run(
-            ['age', '-d', '-i', SSH_KEY],
-            input=encrypted_data,
-            capture_output=True
-        )
+        for key_path, key_type in SSH_KEYS:
+            result = subprocess.run(
+                ['age', '-d', '-i', key_path],
+                input=encrypted_data,
+                capture_output=True
+            )
 
-        if result.returncode == 0:
-            return result.stdout.decode('utf-8').strip()
+            if result.returncode == 0:
+                return result.stdout.decode('utf-8').strip()
+
+            if not ensure_ssh_key_loaded(key_path):
+                syslog.syslog(syslog.LOG_WARNING, f"Failed to load {key_type} SSH key into ssh-agent")
+                continue
+
+            result = subprocess.run(
+                ['age', '-d', '-i', key_path],
+                input=encrypted_data,
+                capture_output=True
+            )
+
+            if result.returncode == 0:
+                return result.stdout.decode('utf-8').strip()
 
     except Exception:
         pass
 
-    return None
-
-def decrypt_with_ssh_key(encrypted_file):
-    """Decrypt data using SSH private key"""
-    if not SSH_KEY or not os.path.exists(SSH_KEY):
-        return None
-
-    try:
-        with open(encrypted_file, 'rb') as f:
-            encrypted_data = f.read()
-        
-        # First try direct decryption (for PKCS8 format keys)
-        result = subprocess.run(
-            ['openssl', 'pkeyutl', '-decrypt', '-inkey', SSH_KEY],
-            input=encrypted_data,
-            capture_output=True
-        )
-        
-        if result.returncode == 0:
-            return result.stdout.decode('utf-8').strip()
-        
-        # If that fails, convert key format first using secure temp file
-        # Security fix: Use tempfile.NamedTemporaryFile to avoid predictable paths
-        # and set restrictive permissions immediately to prevent race conditions
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as temp_file:
-            temp_pem = temp_file.name
-            # Set restrictive permissions immediately
-            os.chmod(temp_pem, 0o600)
-        
-        try:
-            # Use appropriate conversion command based on key type
-            if SSH_KEY_TYPE == "RSA":
-                convert_cmd = ['openssl', 'rsa', '-in', SSH_KEY, '-out', temp_pem]
-            elif SSH_KEY_TYPE == "DSA":
-                convert_cmd = ['openssl', 'dsa', '-in', SSH_KEY, '-out', temp_pem]
-            elif SSH_KEY_TYPE == "ECDSA":
-                convert_cmd = ['openssl', 'ec', '-in', SSH_KEY, '-out', temp_pem]
-            elif SSH_KEY_TYPE == "Ed25519":
-                # Ed25519 keys are typically in PKCS8 format already
-                # Try converting from OpenSSH format to PKCS8 PEM
-                convert_cmd = ['openssl', 'pkey', '-in', SSH_KEY, '-out', temp_pem]
-            else:
-                # Generic attempt
-                convert_cmd = ['openssl', 'pkey', '-in', SSH_KEY, '-out', temp_pem]
-            
-            convert_result = subprocess.run(convert_cmd, capture_output=True)
-            
-            if convert_result.returncode == 0:
-                # Try decryption with converted key
-                result = subprocess.run(
-                    ['openssl', 'pkeyutl', '-decrypt', '-inkey', temp_pem],
-                    input=encrypted_data,
-                    capture_output=True
-                )
-                
-                if result.returncode == 0:
-                    return result.stdout.decode('utf-8').strip()
-        finally:
-            # Always clean up temp file
-            if os.path.exists(temp_pem):
-                os.remove(temp_pem)
-    
-    except Exception:
-        pass
-    
     return None
 
 def validate_environment():
@@ -749,40 +684,17 @@ def main():
     
     password = None
 
-    # Priority 1: Age encrypted file (for Ed25519 keys)
     if os.path.exists(AGE_ENCRYPTED_FILE):
         password = decrypt_with_age(AGE_ENCRYPTED_FILE)
         if password:
             print(password)
             key_info = f" ({SSH_KEY_TYPE} key)" if SSH_KEY_TYPE else ""
             syslog.syslog(syslog.LOG_INFO, f"Password retrieved via age encryption{key_info}")
-            # Clear password from memory
             password = secure_memory_clear(password)
             return
 
-    # Priority 2: SSH encrypted file (for RSA/ECDSA/DSA keys)
     if os.path.exists(SSH_ENCRYPTED_FILE):
-        password = decrypt_with_ssh_key(SSH_ENCRYPTED_FILE)
-        if password:
-            print(password)
-            key_info = f" ({SSH_KEY_TYPE} key)" if SSH_KEY_TYPE else ""
-            syslog.syslog(syslog.LOG_INFO, f"Password retrieved via SSH encryption{key_info}")
-            # Clear password from memory
-            password = secure_memory_clear(password)
-            return
-    
-    # Priority 3: Keyring
-    if HAS_KEYRING and password is None:
-        try:
-            password = keyring.get_password(SERVICE_NAME, USERNAME)
-            if password:
-                print(password)
-                syslog.syslog(syslog.LOG_INFO, "Password retrieved via keyring")
-                # Clear password from memory
-                password = secure_memory_clear(password)
-                return
-        except Exception:
-            pass
+        syslog.syslog(syslog.LOG_WARNING, f"Legacy OpenSSL password file ignored: {SSH_ENCRYPTED_FILE}")
     
     # No password found
     print("Error: No password found in secure storage", file=sys.stderr)

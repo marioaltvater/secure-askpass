@@ -1,66 +1,56 @@
-# Security Enhancements for SSH Askpass Helper
+# Security Notes
 
-## Overview
-The askpass script uses a native GNOME confirmation dialog and multiple security layers to prevent unauthorized access while keeping sudo prompts usable in a desktop session.
+`secure-askpass` is designed for convenience on trusted Linux VMs where agents
+regularly need `sudo`.
 
-## Security Features
+## What It Protects
 
-### 1. GNOME Confirmation Dialog
-- Shows a native GTK4/libadwaita dialog
-- Displays the command being executed, user, and hostname
-- Requires explicit user approval for each sudo request
-- Follows the active GNOME theme, including dark mode
-- Has no fallback to other GUI toolkits in this fork
+- The stored sudo password is encrypted with `age`.
+- The age recipient is an Ed25519 or RSA SSH public key.
+- The stored file is `~/.sudo_askpass.age` with `0600` permissions.
+- The askpass script refuses calls where `SUDO_ASKPASS` points somewhere else.
+- The immediate parent process must be `sudo` or `sudo.ws`.
+- Stored credentials expire after the configured number of hours.
+- Approval events are written to syslog and to
+  `~/.config/secure-askpass/audit.log`.
 
-### 2. Path-based Restrictions
-- Only allows execution from trusted directories: `/home/ian/` and `/tmp/`
-- Prevents malicious scripts from arbitrary locations accessing passwords
+## What It Does Not Protect
 
-### 3. Time-based Expiration
-- Passwords automatically expire after 24 hours
-- Expired password files are automatically deleted
-- Configurable via `expiration_hours` in config
+- It does not prove which agent originally ran `sudo`; askpass sees `sudo` as
+  its parent.
+- It does not make an untrusted VM safe. A user account that can run arbitrary
+  code can still attempt to invoke `sudo -A`.
+- It does not support ECDSA or DSA SSH keys for encryption.
 
-### 4. Process Validation
-- Verifies the calling process is from allowed list: `sudo`, `claude-code`, `code`, `bash`, `sh`
-- Prevents unauthorized processes from retrieving passwords
+## Recommended Defaults
 
-### 5. Environment Verification
-- Requires a graphical GNOME session
-- Ensures askpass is called from a legitimate user desktop session
+Keep GNOME confirmation enabled on desktop systems. On headless VMs, use the
+TOTP flow or set a short expiration period.
 
-### 6. Audit Logging
-- All askpass usage is logged to syslog
-- Records calling process, PID, command, and working directory
-- Failed security checks and user denials are logged with warnings
+Per-machine config overrides the repo config:
 
-## Configuration
-Security settings can be configured via `askpass-config.json`:
 ```json
 {
-    "require_user_confirmation": true,
-    "allowed_paths": ["/home/ian/", "/tmp/"],
-    "expiration_hours": 24,
-    "allowed_processes": ["sudo", "claude-code", "codex", "opencode", "opencode-cli", "code", "bash", "sh"]
+  "require_user_confirmation": true,
+  "allowed_paths": ["/"],
+  "expiration_hours": 24,
+  "sudo_parent_processes": ["sudo", "sudo.ws"],
+  "max_attempts_per_hour": 30,
+  "lockout_minutes": 15
 }
 ```
 
-The configuration file is loaded from (in order of priority):
-1. `~/.config/secure-askpass/config.json`
-2. `./askpass-config.json` (in the same directory as the script)
-
 ## Monitoring
-Check audit logs with:
+
 ```bash
 sudo journalctl -t sudo-askpass -f
+./askpass-manager audit
 ```
 
 ## Testing
-Test the setup:
-```bash
-# From within the project directory
-./askpass-manager test
-```
 
-## Backup
-Original askpass script backed up to: `askpass.backup`
+```bash
+./askpass-manager doctor
+./askpass-manager test
+./agent-sudo whoami
+```

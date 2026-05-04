@@ -1,97 +1,109 @@
 # SSH Askpass Helper
 
-A GNOME-only askpass implementation using SSH key encryption for sudo approval.
+Secure askpass helper for agent-friendly `sudo -A` usage on Linux VMs.
 
-## Installation
-
-1. Clone this repository
-2. Ensure you have SSH keys (supports ed25519, ecdsa, rsa, or dsa)
-3. **For Ed25519 keys**: Install the `age` encryption tool
-   - Arch Linux: `sudo pacman -S age`
-   - Ubuntu/Debian: `sudo apt install age`
-   - macOS: `brew install age`
-   - Or build from source: https://github.com/FiloSottile/age#installation
-4. Make sure you are in a GNOME session with GTK4/libadwaita available.
-5. Set the `SUDO_ASKPASS` environment variable in your shell configuration:
-   ```bash
-   export SUDO_ASKPASS="/path/to/secure-askpass/askpass"
-   ```
-6. Store your sudo password:
-   ```bash
-   ./askpass-manager set
-   ```
-
-## Sudo Alternative for Askpass (sudo.ws)
-
-If you are using `sudo-rs` and need `askpass` functionality, you might need to
-configure `sudo.ws` as an alternative for `sudo`, as `sudo-rs` currently
-does not support `askpass`.
-
-To do this, you can use `update-alternatives`:
+The normal agent workflow is:
 
 ```bash
-sudo update-alternatives --install /usr/bin/sudo sudo /usr/bin/sudo.ws 100
-# If you have other sudo alternatives, adjust the priority (100) accordingly.
-# To switch back to another sudo implementation, you can use:
-# sudo update-alternatives --config sudo
+./askpass-manager doctor
+./askpass-manager set
+./agent-sudo whoami
 ```
 
+`agent-sudo` is a tiny wrapper that sets `SUDO_ASKPASS` to this checkout's
+`askpass` script and then runs `sudo -A`.
 
-## Usage
+## Requirements
+
+- Linux with `sudo` askpass support
+- `age`
+- An SSH keypair supported by age: Ed25519 or RSA
+- GNOME with GTK4/libadwaita for the graphical confirmation dialog
+
+Install `age` with your distro package manager:
 
 ```bash
-export SUDO_ASKPASS="/path/to/askpass"
-sudo -A command
+sudo apt install age      # Debian/Ubuntu
+sudo dnf install age      # Fedora
+sudo pacman -S age        # Arch
 ```
 
-Or use the test command:
+If you do not have a supported SSH key yet:
+
 ```bash
+ssh-keygen -t ed25519
+```
+
+## Setup
+
+```bash
+./setup.sh
+./askpass-manager set
 ./askpass-manager test
 ```
 
-## Security
+For shell-wide use, add this to your shell profile:
 
-- Passwords are encrypted with your SSH keys using one of two methods:
-  - **Ed25519 keys**: Uses `age` encryption (requires age tool)
-  - **RSA/ECDSA/DSA keys**: Uses OpenSSL asymmetric encryption
-- Supports multiple SSH key types (ed25519, ecdsa, rsa, dsa) with automatic detection
-- Keys are checked in order of preference: ed25519 > ecdsa > rsa > dsa
-- Encrypted files stored with 600 permissions:
-  - Ed25519: `~/.sudo_askpass.age`
-  - RSA/ECDSA/DSA: `~/.sudo_askpass.ssh`
-- Falls back to system keyring if available
-- Refuses plain text storage
-- The approval dialog is native GNOME GTK4/libadwaita and follows system dark mode
-- Askpass requires a GNOME graphical session and fails closed elsewhere
-
-### Why age for Ed25519?
-
-Ed25519 is a signing algorithm (EdDSA), not an encryption algorithm. While OpenSSL can handle RSA encryption directly, Ed25519 keys cannot be used for asymmetric encryption. The `age` tool was specifically designed to work with SSH keys including Ed25519, providing a secure and modern encryption solution.
-
-### Automatic SSH Key Management
-
-If your SSH key is password-protected (recommended!), the askpass tool will:
-1. Automatically start ssh-agent if not running
-2. Check if your SSH key is loaded
-3. Prompt for your SSH key passphrase via GUI dialog if needed
-4. Load the key into ssh-agent for the session
-
-**Workflow:** You only enter your SSH key passphrase once per session (via GUI), then sudo commands only require the confirmation dialog. No terminal interaction needed.
+```bash
+export SUDO_ASKPASS="/path/to/secure-askpass/askpass"
+alias agent-sudo="/path/to/secure-askpass/agent-sudo"
+```
 
 ## Commands
 
 ```bash
-./askpass-manager set        # Store password (GUI/terminal input)
-./askpass-manager get        # Check if password exists
-./askpass-manager clear      # Remove password
-./askpass-manager test       # Test sudo integration
-./askpass-manager audit      # Show recent askpass usage
+./askpass-manager doctor     # Check prerequisites without invoking sudo
+./askpass-manager set        # Store sudo password
+./askpass-manager get        # Check whether a password is stored
+./askpass-manager clear      # Remove stored password and legacy files
+./askpass-manager test       # Force a fresh sudo auth through askpass
+./askpass-manager audit      # Show recent askpass approvals
 ```
 
-## GNOME-only behavior
+Headless setup is available when you want a TOTP confirmation path:
 
-This fork keeps the sudo approval path focused on GNOME. If you are not in a GNOME session, `sudo -A` will fail closed instead of falling back to a terminal or headless prompt.
+```bash
+./askpass-manager totp-setup
+./askpass-manager set-totp
+TOTP="123456" sudo -A command
+```
 
-## License
+## Security Model
 
-MIT License - see LICENSE file
+- The sudo password is stored in `~/.sudo_askpass.age` with `0600`
+  permissions.
+- The password file is encrypted with age using your Ed25519 or RSA SSH public
+  key.
+- The helper validates that `SUDO_ASKPASS` points at this script.
+- The helper validates that the immediate caller is `sudo` or `sudo.ws`.
+- Stored passwords expire after `expiration_hours` and are removed on the next
+  askpass invocation.
+- GNOME confirmation is enabled by default. Headless sessions can use TOTP.
+- Attempts and approvals are logged to syslog and
+  `~/.config/secure-askpass/audit.log`.
+
+Per-machine config lives at `~/.config/secure-askpass/config.json` and overrides
+the repo default `askpass-config.json`.
+
+Example:
+
+```json
+{
+  "require_user_confirmation": true,
+  "allowed_paths": ["/"],
+  "expiration_hours": 24,
+  "sudo_parent_processes": ["sudo", "sudo.ws"],
+  "max_attempts_per_hour": 30,
+  "lockout_minutes": 15
+}
+```
+
+## sudo-rs Note
+
+If your system uses `sudo-rs`, askpass may not be supported. Use `sudo.ws` as
+the sudo alternative:
+
+```bash
+sudo update-alternatives --install /usr/bin/sudo sudo /usr/bin/sudo.ws 100
+sudo update-alternatives --config sudo
+```

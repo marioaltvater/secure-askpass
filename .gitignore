@@ -34,6 +34,12 @@ ENV/
 # Logs
 *.log
 
+# Local scratch/debug artifacts
+*.backup
+*.backup[0-9]
+debug_*
+final_test.sh
+
 # Named pipes (created at runtime)
 /tmp/sudo_command
 /tmp/sudo_response
