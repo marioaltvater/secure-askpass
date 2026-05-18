@@ -89,7 +89,7 @@ Example:
 
 ```json
 {
-  "require_user_confirmation": true,
+  "require_user_confirmation": false,
   "allowed_paths": ["/"],
   "expiration_hours": "never",
   "sudo_parent_processes": ["sudo", "sudo.ws"],
