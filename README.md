@@ -77,7 +77,7 @@ TOTP="123456" sudo -A command
 - The helper validates that `SUDO_ASKPASS` points at this script.
 - The helper validates that the immediate caller is `sudo` or `sudo.ws`.
 - Stored passwords expire after `expiration_hours` and are removed on the next
-  askpass invocation.
+  askpass invocation. Set `expiration_hours` to `"never"` to disable expiration.
 - GNOME confirmation is enabled by default. Headless sessions can use TOTP.
 - Attempts and approvals are logged to syslog and
   `~/.config/secure-askpass/audit.log`.
@@ -91,7 +91,7 @@ Example:
 {
   "require_user_confirmation": true,
   "allowed_paths": ["/"],
-  "expiration_hours": 24,
+  "expiration_hours": "never",
   "sudo_parent_processes": ["sudo", "sudo.ws"],
   "max_attempts_per_hour": 30,
   "lockout_minutes": 15

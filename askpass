@@ -320,6 +320,9 @@ REQUIRE_USER_CONFIRMATION = config['require_user_confirmation']
 MAX_ATTEMPTS_PER_HOUR = config['max_attempts_per_hour']
 LOCKOUT_MINUTES = config['lockout_minutes']
 
+def password_expiration_disabled():
+    return isinstance(EXPIRATION_HOURS, str) and EXPIRATION_HOURS.lower() == "never"
+
 def check_rate_limit():
     """Check if rate limit has been exceeded"""
     import json
@@ -435,17 +438,18 @@ def check_security():
         return False
     
     # 4. Time-based expiration check
-    for encrypted_file in (AGE_ENCRYPTED_FILE, SSH_ENCRYPTED_FILE):
-        if not os.path.exists(encrypted_file):
-            continue
-        file_age = time.time() - os.path.getmtime(encrypted_file)
-        if file_age > EXPIRATION_HOURS * 3600:
-            syslog.syslog(syslog.LOG_INFO, f"Password file expired after {EXPIRATION_HOURS} hours: {encrypted_file}")
-            try:
-                os.remove(encrypted_file)
-            except:
-                pass
-            return False
+    if not password_expiration_disabled():
+        for encrypted_file in (AGE_ENCRYPTED_FILE, SSH_ENCRYPTED_FILE):
+            if not os.path.exists(encrypted_file):
+                continue
+            file_age = time.time() - os.path.getmtime(encrypted_file)
+            if file_age > EXPIRATION_HOURS * 3600:
+                syslog.syslog(syslog.LOG_INFO, f"Password file expired after {EXPIRATION_HOURS} hours: {encrypted_file}")
+                try:
+                    os.remove(encrypted_file)
+                except:
+                    pass
+                return False
     
     # 5. User confirmation dialog (GNOME only)
     if REQUIRE_USER_CONFIRMATION:

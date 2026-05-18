@@ -25,7 +25,8 @@ regularly need `sudo`.
 ## Recommended Defaults
 
 Keep GNOME confirmation enabled on desktop systems. On headless VMs, use the
-TOTP flow or set a short expiration period.
+TOTP flow or set a short expiration period. Set `expiration_hours` to `"never"`
+only on machines where persistent encrypted sudo storage is acceptable.
 
 Per-machine config overrides the repo config:
 
@@ -33,7 +34,7 @@ Per-machine config overrides the repo config:
 {
   "require_user_confirmation": true,
   "allowed_paths": ["/"],
-  "expiration_hours": 24,
+  "expiration_hours": "never",
   "sudo_parent_processes": ["sudo", "sudo.ws"],
   "max_attempts_per_hour": 30,
   "lockout_minutes": 15

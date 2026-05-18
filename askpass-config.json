@@ -1,7 +1,7 @@
 {
     "require_user_confirmation": true,
     "allowed_paths": ["/"],
-    "expiration_hours": 24,
+    "expiration_hours": "never",
     "sudo_parent_processes": ["sudo", "sudo.ws"],
     "max_attempts_per_hour": 30,
     "lockout_minutes": 15
