@@ -432,8 +432,8 @@ def check_security():
         syslog.syslog(syslog.LOG_WARNING, "Askpass called without proper environment")
         return False
 
-    # 3b. GNOME session requirement
-    if not is_gnome_session():
+    # 3b. GNOME session requirement for graphical confirmation
+    if REQUIRE_USER_CONFIRMATION and not is_gnome_session():
         syslog.syslog(syslog.LOG_WARNING, "Askpass called outside a GNOME session")
         return False
     
